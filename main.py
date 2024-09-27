@@ -1,10 +1,12 @@
 import os
 import time
+import random
 from flask import Flask, request, jsonify, current_app
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 import re
 import openai
 from dotenv import load_dotenv
+from requests.exceptions import HTTPError
 
 # Load environment variables
 load_dotenv()
@@ -21,7 +23,7 @@ def extract_video_id(url):
         return video_id_match.group(1)
     return None
 
-def get_transcript_with_retry(video_id, max_retries=3):
+def get_transcript_with_retry(video_id, max_retries=5):
     for attempt in range(max_retries):
         try:
             current_app.logger.info(f"Attempt {attempt + 1} to fetch transcript for video {video_id}")
@@ -30,11 +32,20 @@ def get_transcript_with_retry(video_id, max_retries=3):
         except TranscriptsDisabled:
             current_app.logger.error(f"Transcripts are disabled for video {video_id}")
             raise Exception("Transcripts are disabled for this video")
+        except HTTPError as e:
+            if e.response.status_code == 429:  # Too Many Requests
+                sleep_time = (2 ** attempt) + random.uniform(0, 1)
+                current_app.logger.warning(f"Rate limit hit. Waiting for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
+            else:
+                raise
         except Exception as e:
             current_app.logger.error(f"Error fetching transcript on attempt {attempt + 1}: {str(e)}")
             if attempt == max_retries - 1:
                 raise Exception(f"Error fetching transcript after {max_retries} attempts: {str(e)}")
-            time.sleep(1)  # Court délai entre les tentatives
+            sleep_time = (2 ** attempt) + random.uniform(0, 1)
+            current_app.logger.info(f"Waiting for {sleep_time:.2f} seconds before next attempt")
+            time.sleep(sleep_time)
     raise Exception("Max retries reached")
 
 def improve_transcript(text):

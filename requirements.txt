@@ -1,5 +1,6 @@
-   flask
-   youtube-transcript-api
-   openai
-   gunicorn
-   python-dotenv
+flask
+youtube-transcript-api==0.6.2
+openai
+gunicorn
+python-dotenv
+requests
