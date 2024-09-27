@@ -21,16 +21,18 @@ def extract_video_id(url):
         return video_id_match.group(1)
     return None
 
-def get_transcript(video_id):
-    try:
-        # Add a delay to avoid rate limiting
-        time.sleep(1)
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join([entry['text'] for entry in transcript])
-    except TranscriptsDisabled:
-        raise Exception("Transcripts are disabled for this video")
-    except Exception as e:
-        raise Exception(f"Error fetching transcript: {str(e)}")
+def get_transcript_with_retry(video_id, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            time.sleep(5 * (attempt + 1))  # Délai croissant
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            return " ".join([entry['text'] for entry in transcript])
+        except TranscriptsDisabled:
+            raise Exception("Transcripts are disabled for this video")
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise Exception(f"Error fetching transcript after {max_retries} attempts: {str(e)}")
+    raise Exception("Max retries reached")
 
 def improve_transcript(text):
     try:
@@ -58,17 +60,17 @@ def process_youtube():
         if not video_id:
             return jsonify({"error": "Invalid YouTube URL"}), 400
 
-        transcript = get_transcript(video_id)
+        transcript = get_transcript_with_retry(video_id)
         improved_transcript = improve_transcript(transcript)
 
         return jsonify({"improved_transcript": improved_transcript})
 
     except Exception as e:
         error_message = str(e)
-        if "rate limit" in error_message.lower():
-            return jsonify({"error": error_message}), 429
+        if "Too Many Requests" in error_message or "rate limit" in error_message.lower():
+            return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
         elif "transcripts are disabled" in error_message.lower():
-            return jsonify({"error": error_message}), 400
+            return jsonify({"error": "Transcripts are not available for this video"}), 400
         else:
             return jsonify({"error": f"An unexpected error occurred: {error_message}"}), 500
 
