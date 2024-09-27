@@ -1,6 +1,7 @@
 import os
+import time
 from flask import Flask, request, jsonify
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 import re
 import openai
 from dotenv import load_dotenv
@@ -22,10 +23,14 @@ def extract_video_id(url):
 
 def get_transcript(video_id):
     try:
+        # Add a delay to avoid rate limiting
+        time.sleep(1)
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         return " ".join([entry['text'] for entry in transcript])
+    except TranscriptsDisabled:
+        raise Exception("Transcripts are disabled for this video")
     except Exception as e:
-        return f"Error fetching transcript: {str(e)}"
+        raise Exception(f"Error fetching transcript: {str(e)}")
 
 def improve_transcript(text):
     try:
@@ -37,8 +42,10 @@ def improve_transcript(text):
             ]
         )
         return response.choices[0].message.content
+    except openai.error.RateLimitError:
+        raise Exception("OpenAI API rate limit reached. Please try again later.")
     except Exception as e:
-        return f"Error improving transcript: {str(e)}"
+        raise Exception(f"Error improving transcript: {str(e)}")
 
 @app.route('/process_youtube', methods=['POST'])
 def process_youtube():
@@ -52,17 +59,18 @@ def process_youtube():
             return jsonify({"error": "Invalid YouTube URL"}), 400
 
         transcript = get_transcript(video_id)
-        if transcript.startswith("Error"):
-            return jsonify({"error": transcript}), 500
-
         improved_transcript = improve_transcript(transcript)
-        if improved_transcript.startswith("Error"):
-            return jsonify({"error": improved_transcript}), 500
 
         return jsonify({"improved_transcript": improved_transcript})
 
     except Exception as e:
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+        error_message = str(e)
+        if "rate limit" in error_message.lower():
+            return jsonify({"error": error_message}), 429
+        elif "transcripts are disabled" in error_message.lower():
+            return jsonify({"error": error_message}), 400
+        else:
+            return jsonify({"error": f"An unexpected error occurred: {error_message}"}), 500
 
 @app.route('/', methods=['GET'])
 def home():
