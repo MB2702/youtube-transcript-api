@@ -1,114 +1,117 @@
 import os
 import time
-import random
 from flask import Flask, request, jsonify, current_app
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
-import re
-import openai
 from dotenv import load_dotenv
-from requests.exceptions import HTTPError
+from urllib.parse import urlparse, parse_qs
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from openai import OpenAI
+import youtube_transcript_api
+import logging
+from logging.handlers import RotatingFileHandler
 
-# Load environment variables
+# Chargement des variables d'environnement
 load_dotenv()
 
 app = Flask(__name__)
 
-# Set up OpenAI API key
-openai.api_key = os.getenv('OPENAI_API_KEY')
+# Configuration du logging
+handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=1)
+handler.setLevel(logging.INFO)
+app.logger.addHandler(handler)
+app.logger.setLevel(logging.INFO)
+
+# Configuration des APIs
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 def extract_video_id(url):
-    # Extract video ID from YouTube URL
-    video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
-    if video_id_match:
-        return video_id_match.group(1)
+    """Extrait l'ID de la vidéo à partir de différents formats d'URL YouTube."""
+    parsed_url = urlparse(url)
+    if parsed_url.hostname == 'youtu.be':
+        return parsed_url.path[1:]
+    if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
+        if parsed_url.path == '/watch':
+            p = parse_qs(parsed_url.query)
+            return p.get('v', [None])[0]
+        if parsed_url.path[:7] == '/embed/':
+            return parsed_url.path.split('/')[2]
+        if parsed_url.path[:3] == '/v/':
+            return parsed_url.path.split('/')[2]
     return None
 
-def get_transcript_with_retry(video_id, max_retries=5):
-    for attempt in range(max_retries):
-        try:
-            current_app.logger.info(f"Attempt {attempt + 1} to fetch transcript for video {video_id}")
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            return " ".join([entry['text'] for entry in transcript])
-        except TranscriptsDisabled:
-            current_app.logger.error(f"Transcripts are disabled for video {video_id}")
-            raise Exception("Transcripts are disabled for this video")
-        except HTTPError as e:
-            if e.response.status_code == 429:  # Too Many Requests
-                sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                current_app.logger.warning(f"Rate limit hit. Waiting for {sleep_time:.2f} seconds")
-                time.sleep(sleep_time)
-            else:
-                raise
-        except Exception as e:
-            current_app.logger.error(f"Error fetching transcript on attempt {attempt + 1}: {str(e)}")
-            if attempt == max_retries - 1:
-                raise Exception(f"Error fetching transcript after {max_retries} attempts: {str(e)}")
-            sleep_time = (2 ** attempt) + random.uniform(0, 1)
-            current_app.logger.info(f"Waiting for {sleep_time:.2f} seconds before next attempt")
-            time.sleep(sleep_time)
-    raise Exception("Max retries reached")
-
-def improve_transcript(text):
+def get_video_transcript(video_id):
+    """Récupère la transcription de la vidéo en utilisant l'API YouTube et youtube_transcript_api."""
     try:
-        current_app.logger.info("Starting transcript improvement with OpenAI")
-        response = openai.ChatCompletion.create(
+        # Essayez d'abord avec youtube_transcript_api
+        transcript = youtube_transcript_api.YouTubeTranscriptApi.get_transcript(video_id)
+        return " ".join([entry['text'] for entry in transcript]), None
+    except youtube_transcript_api.NoTranscriptAvailable:
+        current_app.logger.warning(f"No transcript available via youtube_transcript_api for video ID: {video_id}")
+        # Si ça échoue, essayez avec l'API YouTube officielle
+        try:
+            captions = youtube.captions().list(part='snippet', videoId=video_id).execute()
+            if 'items' not in captions or len(captions['items']) == 0:
+                return None, "No captions available for this video"
+            
+            caption_id = captions['items'][0]['id']
+            subtitle = youtube.captions().download(id=caption_id, tfmt='srt').execute()
+            return subtitle.decode('utf-8'), None
+        except HttpError as e:
+            current_app.logger.error(f"YouTube API error: {e}")
+            return None, f"An error occurred: {e}"
+    except Exception as e:
+        current_app.logger.error(f"Unexpected error in get_video_transcript: {e}")
+        return None, f"An unexpected error occurred: {e}"
+
+def improve_transcript_with_openai(transcript):
+    """Améliore la transcription en utilisant OpenAI."""
+    try:
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that improves transcripts by adding proper punctuation and formatting."},
-                {"role": "user", "content": f"Please improve this transcript by adding proper punctuation and formatting:\n\n{text}"}
-            ]
+                {"role": "system", "content": "You are a helpful assistant that improves transcripts by adding proper punctuation, formatting, and correcting obvious errors."},
+                {"role": "user", "content": f"Please improve this transcript:\n\n{transcript}"}
+            ],
+            max_tokens=4000  # Ajustez selon vos besoins
         )
-        current_app.logger.info("Transcript improvement completed successfully")
         return response.choices[0].message.content
-    except openai.error.RateLimitError:
-        current_app.logger.error("OpenAI API rate limit reached")
-        raise Exception("OpenAI API rate limit reached. Please try again later.")
     except Exception as e:
-        current_app.logger.error(f"Error improving transcript: {str(e)}")
-        raise Exception(f"Error improving transcript: {str(e)}")
+        current_app.logger.error(f"OpenAI API error: {e}")
+        return transcript  # Retourne la transcription originale en cas d'erreur
 
 @app.route('/process_youtube', methods=['POST'])
 def process_youtube():
     try:
-        current_app.logger.info("Received request")
         youtube_url = request.json.get('url')
-        current_app.logger.info(f"Processing URL: {youtube_url}")
-        
         if not youtube_url:
-            current_app.logger.warning("No YouTube URL provided")
             return jsonify({"error": "No YouTube URL provided"}), 400
 
         video_id = extract_video_id(youtube_url)
-        current_app.logger.info(f"Extracted video ID: {video_id}")
-        
         if not video_id:
-            current_app.logger.warning("Invalid YouTube URL")
             return jsonify({"error": "Invalid YouTube URL"}), 400
+        
+        current_app.logger.info(f"Processing video ID: {video_id}")
+        
+        transcript, error = get_video_transcript(video_id)
+        
+        if error:
+            return jsonify({"error": error}), 400
 
-        current_app.logger.info("Fetching transcript")
-        transcript = get_transcript_with_retry(video_id)
-        current_app.logger.info("Transcript fetched successfully")
-
-        current_app.logger.info("Improving transcript")
-        improved_transcript = improve_transcript(transcript)
-        current_app.logger.info("Transcript improved successfully")
-
-        return jsonify({"improved_transcript": improved_transcript})
+        if transcript:
+            improved_transcript = improve_transcript_with_openai(transcript)
+            return jsonify({"transcript": improved_transcript})
+        else:
+            return jsonify({"error": "Failed to retrieve transcript"}), 500
 
     except Exception as e:
-        current_app.logger.error(f"An error occurred: {str(e)}")
-        error_message = str(e)
-        if "Too Many Requests" in error_message or "rate limit" in error_message.lower():
-            return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
-        elif "transcripts are disabled" in error_message.lower():
-            return jsonify({"error": "Transcripts are not available for this video"}), 400
-        else:
-            return jsonify({"error": f"An unexpected error occurred: {error_message}"}), 500
+        current_app.logger.error(f"Unexpected error in process_youtube: {str(e)}")
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route('/', methods=['GET'])
 def home():
     return "YouTube Transcript Processor API is running. Use POST /process_youtube to process a YouTube URL."
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(debug=True)
