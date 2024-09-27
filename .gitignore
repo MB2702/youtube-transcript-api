@@ -3,3 +3,4 @@
    __pycache__/
    *.pycvenv/
 app.log
+venv/
